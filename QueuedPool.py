@@ -4,6 +4,30 @@ import multiprocessing
 import time
 
 
+class SafeValue(object):
+    """ Thread safe value. Uses locks. 
+    
+    Source: http://eli.thegreenplace.net/2012/01/04/shared-counter-with-pythons-multiprocessing
+    """
+    def __init__(self, initval=0):
+        self.val = multiprocessing.Value('i', initval)
+        self.lock = multiprocessing.Lock()
+
+
+    def increment(self):
+        with self.lock:
+            self.val.value += 1
+
+    def set(self, n):
+        with self.lock:
+            self.val.value = n
+
+    def value(self):
+        with self.lock:
+            return self.val.value
+
+
+
 class QueuedPool(object):
     """ Provides capability of creating a pool of workers which will process jobs in a given queue, and the 
         input queue can be updated in another thread. 
@@ -24,7 +48,10 @@ class QueuedPool(object):
         if cores is None:
             cores = multiprocessing.cpu_count()
 
-        self.cores = cores
+        if cores is None:
+            cores = 1
+
+        self.cores = SafeValue(cores)
 
         # Initialize queues
         self.input_queue = multiprocessing.Queue()
@@ -33,7 +60,7 @@ class QueuedPool(object):
         self.func = func
         self.pool = None
 
-        self.total_jobs = 0
+        self.total_jobs = SafeValue()
 
         # Start the pool with the given parameters - this will wait until the input queue is given jobs
         self.startPool()
@@ -65,7 +92,7 @@ class QueuedPool(object):
 
         # Initialize the pool of workers with the given number of worker cores
         # Comma in the argument list is a must!
-        self.pool = multiprocessing.Pool(self.cores, self._workerFunc, (self.func, ))
+        self.pool = multiprocessing.Pool(self.cores.value(), self._workerFunc, (self.func, ))
 
 
 
@@ -78,15 +105,21 @@ class QueuedPool(object):
             while True:
                 
                 # If all jobs are done, close the pool
-                if self.output_queue.qsize() == self.total_jobs:
+                if self.output_queue.qsize() == self.total_jobs.value():
 
                     # Insert the 'poison pill' to the queue, to kill all workers
-                    for i in range(self.cores):
+                    for i in range(self.cores.value()):
                         self.input_queue.put(None)
+
+
+                    # Wait until the pills are 'swallowed'
+                    while self.input_queue.qsize():
+                        time.sleep(0.1)
 
 
                     # Close the pool and wait for all threads to terminate
                     self.pool.close()
+                    self.pool.terminate()
                     self.pool.join()
 
                     return
@@ -107,7 +140,7 @@ class QueuedPool(object):
         if cores is None:
             cores = multiprocessing.cpu_count()
 
-        self.cores = cores
+        self.cores.set(cores)
 
         self.startPool()
 
@@ -120,7 +153,7 @@ class QueuedPool(object):
         """
 
         # Track the total number of jobs received
-        self.total_jobs += 1
+        self.total_jobs.increment()
 
         if not isinstance(job, list):
             job = [job]
@@ -136,8 +169,12 @@ class QueuedPool(object):
         results = []
 
         # Get all elements in the output queue
-        while self.output_queue.qsize():
-            results.append(self.output_queue.get())
+        while True:
+            try:
+                results.append(self.output_queue.get(False))
+            except:
+                break
+            
 
         return results
 
